@@ -169,7 +169,3 @@ if __name__ == "__main__":
     out_path = os.path.join(LOCAL_PATH, "speech_score.tsv")
     speech_score.to_csv(out_path, sep="\t")
     print(f"\nSaved {len(speech_score):,} rows to {out_path}")
-
-    print("\nNext steps:")
-    print("  1. Upload data/speech_score.tsv to OSF project uz6hg")
-    print("  2. Deploy streamlit_app.py to Streamlit Community Cloud")

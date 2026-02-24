@@ -32,7 +32,16 @@ def load_speech_score(local_path=LOCAL_PATH):
                         remote_file.write_to(f)
                     break
 
-    return pd.read_csv(score_file, delimiter="\t", index_col=0)
+    speech_score = pd.read_csv(score_file, delimiter="\t", index_col=0, dtype={
+        "work": str,
+        "pref": str,
+        "line": str,
+        "speech_id": str,
+        "score": float,
+    })
+    speech_score.loc[speech_score["work"]=="Sack of Troy", "pref"] = " "
+    
+    return speech_score
 
 
 #

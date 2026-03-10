@@ -5,11 +5,18 @@
 import streamlit as st
 import os
 from osfclient import OSF
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.linear_model import LogisticRegression
 
 LOCAL_PATH = "data"
 OSF_PROJECT = "uz6hg"
+N_COMPONENTS = 3
+SAMPLE_SIZE = 1000
+WINDOW_SIZE = 500
+N_FEATURES = 100
 
 
 #
@@ -17,38 +24,144 @@ OSF_PROJECT = "uz6hg"
 #
 
 @st.cache_data
-def load_speech_score(local_path=LOCAL_PATH):
-    """Load pre-computed speech scores, downloading from OSF if needed."""
-    score_file = os.path.join(local_path, "speech_score.tsv")
+def load_tokens(local_path=LOCAL_PATH):
+    """Load tokens, downloading from OSF if needed."""
+    token_file = os.path.join(local_path, "tokens.tsv")
 
-    if not os.path.exists(score_file):
+    if not os.path.exists(token_file):
         with st.spinner("Downloading data from OSF..."):
             osf = OSF()
             project = osf.project(OSF_PROJECT)
             os.makedirs(local_path, exist_ok=True)
             for remote_file in project.storage("osfstorage").files:
-                if remote_file.name == "speech_score.tsv":
-                    with open(score_file, "wb") as f:
+                if remote_file.name == "tokens.tsv":
+                    with open(token_file, "wb") as f:
                         remote_file.write_to(f)
                     break
 
-    speech_score = pd.read_csv(score_file, delimiter="\t", index_col=0, dtype={
-        "work": str,
-        "pref": str,
-        "line": str,
-        "speech_id": str,
-        "score": float,
-    })
-    speech_score.loc[speech_score["work"]=="Sack of Troy", "pref"] = " "
-    
+    tokens = pd.read_csv(token_file, delimiter="\t", dtype=str)
+
+    # collapse elided and unelided forms
+    tokens.loc[tokens["lemma"] == "δʼ", "lemma"] = "δέ"
+    tokens.loc[tokens["lemma"] == "τʼ", "lemma"] = "τε"
+    tokens.loc[tokens["lemma"] == "ἀλλʼ", "lemma"] = "ἀλλά"
+    tokens.loc[tokens["lemma"] == "ἄρʼ", "lemma"] = "ἄρα"
+    tokens.loc[tokens["lemma"] == "ἐπʼ", "lemma"] = "ἐπί"
+    tokens.loc[tokens["lemma"] == "οὐδʼ", "lemma"] = "οὐδέ"
+    tokens.loc[tokens["work"] == "Sack of Troy", "pref"] = " "
+
+    return tokens
+
+
+@st.cache_data
+def compute_speech_score(tokens, col="lemma",
+                         n_features=N_FEATURES,
+                         sample_size=SAMPLE_SIZE,
+                         window_size=WINDOW_SIZE):
+    """Compute rolling speech scores from token table."""
+
+    # --- feature selection ---
+    feat_count = tokens.loc[~(tokens["pos"] == "PUNCT"), col].value_counts()
+    feature_set = feat_count.head(n_features).index
+
+    # --- training samples ---
+    nr_mask = tokens["speaker"].isna()
+    sp_mask = tokens["speaker"].notna() & tokens["speaker"].ne("Odysseus-Apologue")
+
+    nara_group_ids = pd.Series("oth", index=tokens.index)
+    nara_group_ids[nr_mask] = "nar"
+    nara_group_ids[sp_mask] = "spk"
+
+    auth_group_ids = tokens["work"].str.slice(0, 4)
+    group_ids = auth_group_ids + "-" + nara_group_ids
+
+    sample_ids = pd.Series(index=tokens.index, dtype=str)
+    for group in group_ids.unique():
+        n_toks = sum(group_ids == group)
+        sample_ids.loc[group_ids == group] = (
+            np.random.permutation(n_toks) // sample_size
+        )
+    sample_ids = group_ids + "-" + sample_ids.map(lambda f: f"{int(f):03d}")
+
+    tokens_per_sample = tokens.groupby(sample_ids).size()
+
+    # filter-first: only create dummies for the top-N lemmas
+    filtered = tokens[col].where(tokens[col].isin(feature_set))
+    train_samples = (
+        pd.get_dummies(filtered)
+        .reindex(columns=feature_set, fill_value=0)
+        .groupby(sample_ids)
+        .agg("sum")
+    )
+    train_samples = train_samples.div(tokens_per_sample, axis=0) * 1000
+
+    # --- PCA ---
+    pca_model = PCA(n_components=N_COMPONENTS)
+    train_pca = pd.DataFrame(
+        data=pca_model.fit_transform(train_samples),
+        columns=["PC1", "PC2", "PC3"],
+        index=train_samples.index,
+    )
+
+    # --- logistic regression on nar/spk only ---
+    mask = ~train_pca.index.str.contains("-oth-")
+    X = train_pca.loc[mask, ["PC1", "PC2"]].values
+    y = train_pca.index[mask].str.contains("spk").astype(int)
+    clf = LogisticRegression()
+    clf.fit(X, y)
+
+    # --- rolling window test (filter-first optimization) ---
+    feat_dummies = (
+        pd.get_dummies(filtered)
+        .reindex(columns=feature_set, fill_value=0)
+    )
+
+    roll_sum = (
+        feat_dummies
+        .rolling(window=window_size, center=True,
+                 min_periods=int(window_size * 0.7))
+        .agg("sum")
+        .fillna(0)
+        .astype(int)
+    )
+    tokens_per_window = (
+        tokens[col]
+        .rolling(window=window_size, center=True,
+                 min_periods=int(window_size * 0.7))
+        .agg("count")
+        .fillna(0)
+        .astype(int)
+    )
+    test_samples = roll_sum.div(tokens_per_window, axis=0) * 1000
+    valid = test_samples.dropna()
+
+    test_pca = pd.DataFrame(
+        data=pca_model.transform(valid),
+        columns=["PC1", "PC2", "PC3"],
+        index=valid.index,
+    )
+
+    proj = test_pca[["PC1", "PC2"]].values @ clf.coef_.T + clf.intercept_
+    speech_score = pd.DataFrame(
+        dict(
+            work=tokens.loc[test_pca.index, "work"],
+            pref=tokens.loc[test_pca.index, "pref"],
+            line=tokens.loc[test_pca.index, "line"],
+            speech_id=tokens.loc[test_pca.index, "speech_id"],
+            score=proj.flatten(),
+        ),
+        index=test_pca.index,
+    )
     return speech_score
 
 
 #
-# load data
+# load data and compute
 #
 
-speech_score = load_speech_score()
+tokens = load_tokens()
+with st.spinner("Computing speech scores..."):
+    speech_score = compute_speech_score(tokens)
 
 #
 # plot

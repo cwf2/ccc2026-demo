@@ -11,6 +11,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 
 LOCAL_PATH = "data"
 OSF_PROJECT = "uz6hg"
@@ -54,13 +55,49 @@ def load_tokens(local_path=LOCAL_PATH):
     return tokens
 
 
-def run_training(tokens, col="lemma",
-                         n_features=N_FEATURES,
-                         sample_size=SAMPLE_SIZE):
-    
-    # --- feature selection ---
-    feat_count = tokens.loc[~(tokens["pos"] == "PUNCT"), col].value_counts()
-    feature_set = feat_count.head(n_features).index
+def _sample_dummies(tokens, col, features, sample_ids, tokens_per_sample):
+    """Per-1000-word feature frequencies for training samples."""
+    filtered = tokens[col].where(tokens[col].isin(features))
+    raw = (
+        pd.get_dummies(filtered)
+        .reindex(columns=features, fill_value=0)
+        .groupby(sample_ids)
+        .agg("sum")
+        .div(tokens_per_sample, axis=0) * 1000
+    )
+    return raw
+
+
+def _window_dummies(tokens, col, features, window_size, tokens_per_window):
+    """Per-1000-token rolling window feature frequencies."""
+    filtered = tokens[col].where(tokens[col].isin(features))
+    roll_sum = (
+        pd.get_dummies(filtered)
+        .reindex(columns=features, fill_value=0)
+        .rolling(window=window_size, center=True,
+                 min_periods=int(window_size * 0.7))
+        .agg("sum")
+        .fillna(0)
+        .astype(int)
+    )
+    return roll_sum.div(tokens_per_window, axis=0) * 1000
+
+
+def run_training(tokens, feature_set=None, sample_size=SAMPLE_SIZE):
+
+    # --- default feature set ---
+    if feature_set is None:
+        lemma_count = tokens.loc[~(tokens["pos"] == "PUNCT"), "lemma"].value_counts()
+        pos_vals = sorted(v for v in tokens["pos"].dropna().unique() if v != "PUNCT")
+        feature_set = {
+            "lemma": list(lemma_count.head(N_FEATURES).index),
+            "pos": pos_vals,
+        }
+
+    # drop columns with no features selected
+    feature_set = {col: feats for col, feats in feature_set.items() if feats}
+    if not feature_set:
+        raise ValueError("No features selected.")
 
     # --- training samples ---
     nr_mask = tokens["speaker"].isna()
@@ -73,7 +110,6 @@ def run_training(tokens, col="lemma",
     auth_group_ids = tokens["work"].str.slice(0, 4)
     group_ids = auth_group_ids + "-" + nara_group_ids
 
-    # use seed to reset random number generator every time samples are calculated
     rng = np.random.default_rng(st.session_state["seed"])
 
     sample_ids = pd.Series(index=tokens.index, dtype=str)
@@ -86,15 +122,20 @@ def run_training(tokens, col="lemma",
 
     tokens_per_sample = tokens.groupby(sample_ids).size()
 
-    # filter-first: only create dummies for the top-N lemmas
-    filtered = tokens[col].where(tokens[col].isin(feature_set))
-    train_samples = (
-        pd.get_dummies(filtered)
-        .reindex(columns=feature_set, fill_value=0)
-        .groupby(sample_ids)
-        .agg("sum")
-    )
-    train_samples = train_samples.div(tokens_per_sample, axis=0) * 1000
+    # --- per-column dummies, scale, concatenate ---
+    scalers = {}
+    parts = []
+    for col, features in feature_set.items():
+        raw = _sample_dummies(tokens, col, features, sample_ids, tokens_per_sample)
+        scaler = StandardScaler()
+        scaled = pd.DataFrame(
+            scaler.fit_transform(raw),
+            columns=[f"{col}_{f}" for f in features],
+            index=raw.index,
+        )
+        scalers[col] = scaler
+        parts.append(scaled)
+    train_samples = pd.concat(parts, axis=1)
 
     # --- PCA ---
     pca_model = PCA(n_components=N_COMPONENTS)
@@ -110,9 +151,9 @@ def run_training(tokens, col="lemma",
     y = train_pca.index[mask].str.contains("spk").astype(int)
     clf = LogisticRegression()
     clf.fit(X, y)
-    
-    st.session_state["col"] = col
+
     st.session_state["feature_set"] = feature_set
+    st.session_state["scalers"] = scalers
     st.session_state["auth_group_ids"] = auth_group_ids
     st.session_state["nara_group_ids"] = nara_group_ids
     st.session_state["train_sample_ids"] = sample_ids
@@ -120,40 +161,37 @@ def run_training(tokens, col="lemma",
     st.session_state["pca_model"] = pca_model
     st.session_state["train_pca"] = train_pca
     st.session_state["clf"] = clf
-    
+
 
 def compute_speech_score(tokens, window_size=WINDOW_SIZE):
     """Compute rolling speech scores from token table."""
-    
-    col = st.session_state["col"]
+
     feature_set = st.session_state["feature_set"]
+    scalers = st.session_state["scalers"]
     pca_model = st.session_state["pca_model"]
-    filtered = tokens[col].where(tokens[col].isin(feature_set))
     clf = st.session_state["clf"]
 
-    # --- rolling window test (filter-first optimization) ---
-    feat_dummies = (
-        pd.get_dummies(filtered)
-        .reindex(columns=feature_set, fill_value=0)
-    )
-
-    roll_sum = (
-        feat_dummies
-        .rolling(window=window_size, center=True,
-                 min_periods=int(window_size * 0.7))
-        .agg("sum")
-        .fillna(0)
-        .astype(int)
-    )
+    # tokens per window — use lemma as proxy for total non-null tokens
     tokens_per_window = (
-        tokens[col]
+        tokens["lemma"]
         .rolling(window=window_size, center=True,
                  min_periods=int(window_size * 0.7))
         .agg("count")
         .fillna(0)
         .astype(int)
     )
-    test_samples = roll_sum.div(tokens_per_window, axis=0) * 1000
+
+    parts = []
+    for col, features in feature_set.items():
+        raw = _window_dummies(tokens, col, features, window_size, tokens_per_window)
+        scaled = pd.DataFrame(
+            scalers[col].transform(raw),
+            columns=[f"{col}_{f}" for f in features],
+            index=raw.index,
+        )
+        parts.append(scaled)
+
+    test_samples = pd.concat(parts, axis=1)
     valid = test_samples.dropna()
 
     test_pca = pd.DataFrame(
@@ -184,17 +222,119 @@ if "seed" not in st.session_state:
     st.session_state["seed"] = 19631123171620
 
 tokens = load_tokens()
-with st.spinner("Computing speech scores..."):
-    init_attrs = [
-        "col", "feature_set", "auth_group_ids", "nara_group_ids",
-        "train_sample_ids", "train_samples", "pca_model", "train_pca", "clf",
-    ]
-    for attr in init_attrs:
-        if attr not in st.session_state:
-            run_training(tokens)
-            st.rerun()
 
-    speech_score = compute_speech_score(tokens)
+lemma_feat_count = tokens.loc[~(tokens["pos"] == "PUNCT"), "lemma"].value_counts().head(N_FEATURES)
+pos_tags = sorted(v for v in tokens["pos"].dropna().unique())
+
+with st.sidebar:
+    st.header("Settings")
+
+    seed_input = st.number_input(
+        "Seed (-1 = random)",
+        value=-1,
+        min_value=-1,
+        max_value=2**53 - 1,
+        step=1,
+    )
+    st.caption(f"Current seed: {st.session_state['seed']}")
+
+    if st.button("Recalculate"):
+        lemma_default = st.session_state.get("lemma_all", True)
+        lemma_state = st.session_state.get("lemma_editor", {})
+        lemma_edits = lemma_state.get("edited_rows", {})
+        selected_lemmas = [
+            lemma
+            for i, lemma in enumerate(lemma_feat_count.index)
+            if lemma_edits.get(i, {}).get("include", lemma_default)
+        ]
+
+        pos_all = st.session_state.get("pos_all", None)
+        pos_state = st.session_state.get("pos_editor", {})
+        pos_edits = pos_state.get("edited_rows", {})
+        selected_pos = [
+            pos
+            for i, pos in enumerate(pos_tags)
+            if pos_edits.get(i, {}).get(
+                "include",
+                pos_all if pos_all is not None else pos != "PUNCT",
+            )
+        ]
+
+        st.session_state["selected_features"] = {
+            "lemma": selected_lemmas,
+            "pos": selected_pos,
+        }
+        actual_seed = int(np.random.randint(0, 2**31)) if seed_input == -1 else seed_input
+        st.session_state["seed"] = actual_seed
+        for key in ["pca_model", "speech_score"]:
+            st.session_state.pop(key, None)
+        st.rerun()
+
+    lemma_tab, pos_tab = st.tabs(["Lemma", "POS"])
+
+    with lemma_tab:
+        def _on_lemma_toggle():
+            st.session_state["lemma_all"] = st.session_state["lemma_toggle"]
+            st.session_state.pop("lemma_editor", None)
+        st.checkbox("Select all", value=st.session_state.get("lemma_all", True),
+                    key="lemma_toggle", on_change=_on_lemma_toggle)
+        lemma_default = st.session_state.get("lemma_all", True)
+        lemma_feat_df = pd.DataFrame({
+            "lemma": lemma_feat_count.index,
+            "frequency": lemma_feat_count.values,
+            "include": lemma_default,
+        })
+        st.data_editor(
+            lemma_feat_df,
+            key="lemma_editor",
+            column_config={
+                "include": st.column_config.CheckboxColumn("Include"),
+            },
+            use_container_width=True,
+            height=400,
+            hide_index=True,
+            disabled=["lemma", "frequency"],
+        )
+
+    with pos_tab:
+        def _on_pos_toggle():
+            st.session_state["pos_all"] = st.session_state["pos_toggle"]
+            st.session_state.pop("pos_editor", None)
+        st.checkbox("Select all", value=st.session_state.get("pos_all", True),
+                    key="pos_toggle", on_change=_on_pos_toggle)
+        pos_all = st.session_state.get("pos_all", None)
+        pos_df = pd.DataFrame({
+            "pos": pos_tags,
+            "include": [
+                pos_all if pos_all is not None else p != "PUNCT"
+                for p in pos_tags
+            ],
+        })
+        st.data_editor(
+            pos_df,
+            key="pos_editor",
+            column_config={
+                "include": st.column_config.CheckboxColumn("Include"),
+            },
+            use_container_width=True,
+            hide_index=True,
+            disabled=["pos"],
+        )
+
+if "pca_model" not in st.session_state:
+    try:
+        with st.spinner("Training model..."):
+            feature_set = st.session_state.get("selected_features")
+            run_training(tokens, feature_set=feature_set)
+    except ValueError as e:
+        st.error(str(e))
+        st.stop()
+
+if "speech_score" not in st.session_state:
+    with st.spinner("Computing speech scores..."):
+        st.session_state["speech_score"] = compute_speech_score(tokens)
+
+speech_score = st.session_state["speech_score"]
 
 #
 # plot
@@ -203,7 +343,7 @@ with st.spinner("Computing speech scores..."):
 tab_model, tab_view = st.tabs(["Model", "View"])
 
 with tab_model:
-        
+
     # plot
     auth_labels = (st.session_state["auth_group_ids"]
                     .groupby(st.session_state["train_sample_ids"])
@@ -220,12 +360,12 @@ with tab_model:
         hue = auth_labels,
         style = nara_labels,
     )
-    
+
     # add linear decision boundary to plot
-    
+
     # get the axis limits from the plot
     xlim = g.ax.get_xlim()
-    
+
     # solve for y at each x endpoint: coef[0]*x + coef[1]*y + intercept = 0
     #   => y = -(coef[0]*x + intercept) / coef[1]
     w = st.session_state["clf"].coef_[0]
@@ -235,9 +375,9 @@ with tab_model:
 
     g.ax.plot(xs, ys, "k--", linewidth=1)
     g.ax.set_xlim(xlim)  # restore limits so the line doesn't expand the plot
-    
+
     st.pyplot(g.figure)
-    
+
 
 with tab_view:
     work = st.selectbox(label="Work", options=speech_score["work"].unique())

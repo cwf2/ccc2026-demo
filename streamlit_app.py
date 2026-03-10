@@ -55,12 +55,13 @@ def load_tokens(local_path=LOCAL_PATH):
 
 
 def run_training(tokens, col="lemma",
-                         n_features=N_FEATURES,
+                         feature_set=None,
                          sample_size=SAMPLE_SIZE):
-    
+
     # --- feature selection ---
-    feat_count = tokens.loc[~(tokens["pos"] == "PUNCT"), col].value_counts()
-    feature_set = feat_count.head(n_features).index
+    if feature_set is None:
+        feat_count = tokens.loc[~(tokens["pos"] == "PUNCT"), col].value_counts()
+        feature_set = feat_count.head(N_FEATURES).index
 
     # --- training samples ---
     nr_mask = tokens["speaker"].isna()
@@ -185,9 +186,58 @@ if "seed" not in st.session_state:
 
 tokens = load_tokens()
 
+feat_count = tokens.loc[~(tokens["pos"] == "PUNCT"), "lemma"].value_counts().head(N_FEATURES)
+
+with st.sidebar:
+    st.header("Settings")
+
+    seed_input = st.number_input(
+        "Seed (-1 = random)",
+        value=-1,
+        min_value=-1,
+        max_value=2**128 - 1,
+        step=1,
+    )
+    st.caption(f"Current seed: {st.session_state['seed']}")
+
+    if st.button("Recalculate"):
+        editor_state = st.session_state.get("feature_editor", {})
+        edited_rows = editor_state.get("edited_rows", {})
+        selected = [
+            lemma
+            for i, lemma in enumerate(feat_count.index)
+            if edited_rows.get(i, {}).get("include", True)
+        ]
+        st.session_state["selected_features"] = selected
+        actual_seed = int(np.random.randint(0, 2**31)) if seed_input == -1 else seed_input
+        st.session_state["seed"] = actual_seed
+        for key in ["col", "speech_score"]:
+            st.session_state.pop(key, None)
+        st.rerun()
+
+    feat_df = pd.DataFrame({
+        "lemma": feat_count.index,
+        "frequency": feat_count.values,
+        "include": True,
+    })
+    st.data_editor(
+        feat_df,
+        key="feature_editor",
+        column_config={
+            "include": st.column_config.CheckboxColumn("Include"),
+        },
+        use_container_width=True,
+        height=400,
+        hide_index=True,
+        disabled=["lemma", "frequency"],
+    )
+
 if "col" not in st.session_state:
     with st.spinner("Training model..."):
-        run_training(tokens)
+        feature_set = st.session_state.get("selected_features")
+        if feature_set is not None:
+            feature_set = pd.Index(feature_set)
+        run_training(tokens, feature_set=feature_set)
 
 if "speech_score" not in st.session_state:
     with st.spinner("Computing speech scores..."):

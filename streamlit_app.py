@@ -184,17 +184,16 @@ if "seed" not in st.session_state:
     st.session_state["seed"] = 19631123171620
 
 tokens = load_tokens()
-with st.spinner("Computing speech scores..."):
-    init_attrs = [
-        "col", "feature_set", "auth_group_ids", "nara_group_ids",
-        "train_sample_ids", "train_samples", "pca_model", "train_pca", "clf",
-    ]
-    for attr in init_attrs:
-        if attr not in st.session_state:
-            run_training(tokens)
-            st.rerun()
 
-    speech_score = compute_speech_score(tokens)
+if "col" not in st.session_state:
+    with st.spinner("Training model..."):
+        run_training(tokens)
+
+if "speech_score" not in st.session_state:
+    with st.spinner("Computing speech scores..."):
+        st.session_state["speech_score"] = compute_speech_score(tokens)
+
+speech_score = st.session_state["speech_score"]
 
 #
 # plot

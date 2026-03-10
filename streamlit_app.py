@@ -73,11 +73,14 @@ def run_training(tokens, col="lemma",
     auth_group_ids = tokens["work"].str.slice(0, 4)
     group_ids = auth_group_ids + "-" + nara_group_ids
 
+    # use seed to reset random number generator every time samples are calculated
+    rng = np.random.default_rng(st.session_state["seed"])
+
     sample_ids = pd.Series(index=tokens.index, dtype=str)
     for group in group_ids.unique():
         n_toks = sum(group_ids == group)
         sample_ids.loc[group_ids == group] = (
-            np.random.permutation(n_toks) // sample_size
+            rng.permutation(n_toks) // sample_size
         )
     sample_ids = group_ids + "-" + sample_ids.map(lambda f: f"{int(f):03d}")
 
@@ -108,31 +111,25 @@ def run_training(tokens, col="lemma",
     clf = LogisticRegression()
     clf.fit(X, y)
     
-    return dict(
-        col = col,
-        feature_set = feature_set,
-        auth_group_ids = auth_group_ids,
-        nara_group_ids = nara_group_ids,
-        sample_ids = sample_ids,
-        tokens_per_sample = tokens_per_sample,
-        filtered = filtered,
-        train_samples = train_samples,
-        pca_model = pca_model,
-        pca = train_pca,
-        clf = clf,
-    )
-    
+    st.session_state["col"] = col
+    st.session_state["feature_set"] = feature_set
+    st.session_state["auth_group_ids"] = auth_group_ids
+    st.session_state["nara_group_ids"] = nara_group_ids
+    st.session_state["train_sample_ids"] = sample_ids
+    st.session_state["train_samples"] = train_samples
+    st.session_state["pca_model"] = pca_model
+    st.session_state["train_pca"] = train_pca
+    st.session_state["clf"] = clf
     
 
-def compute_speech_score(tokens, training,
-                         window_size=WINDOW_SIZE):
+def compute_speech_score(tokens, window_size=WINDOW_SIZE):
     """Compute rolling speech scores from token table."""
     
-    col = training["col"]
-    feature_set = training["feature_set"]
-    pca_model = training["pca_model"]
-    filtered = training["filtered"]
-    clf = training["clf"]
+    col = st.session_state["col"]
+    feature_set = st.session_state["feature_set"]
+    pca_model = st.session_state["pca_model"]
+    filtered = tokens[col].where(tokens[col].isin(feature_set))
+    clf = st.session_state["clf"]
 
     # --- rolling window test (filter-first optimization) ---
     feat_dummies = (
@@ -183,10 +180,21 @@ def compute_speech_score(tokens, training,
 # load data and compute
 #
 
+if "seed" not in st.session_state:
+    st.session_state["seed"] = 19631123171620
+
 tokens = load_tokens()
 with st.spinner("Computing speech scores..."):
-    training = run_training(tokens)
-    speech_score = compute_speech_score(tokens, training)
+    init_attrs = [
+        "col", "feature_set", "auth_group_ids", "nara_group_ids",
+        "train_sample_ids", "train_samples", "pca_model", "train_pca", "clf",
+    ]
+    for attr in init_attrs:
+        if attr not in st.session_state:
+            run_training(tokens)
+            st.rerun()
+
+    speech_score = compute_speech_score(tokens)
 
 #
 # plot
@@ -197,16 +205,16 @@ tab_model, tab_view = st.tabs(["Model", "View"])
 with tab_model:
         
     # plot
-    auth_labels = (training["auth_group_ids"]
-                    .groupby(training["sample_ids"])
+    auth_labels = (st.session_state["auth_group_ids"]
+                    .groupby(st.session_state["train_sample_ids"])
                     .agg("first")
                     .values)
-    nara_labels = (training["nara_group_ids"]
-                    .groupby(training["sample_ids"])
+    nara_labels = (st.session_state["nara_group_ids"]
+                    .groupby(st.session_state["train_sample_ids"])
                     .agg("first")
                     .values)
 
-    g = sns.relplot(data=training["pca"],
+    g = sns.relplot(data=st.session_state["train_pca"],
         x = "PC1",
         y = "PC2",
         hue = auth_labels,
@@ -220,8 +228,8 @@ with tab_model:
     
     # solve for y at each x endpoint: coef[0]*x + coef[1]*y + intercept = 0
     #   => y = -(coef[0]*x + intercept) / coef[1]
-    w = training["clf"].coef_[0]
-    b = training["clf"].intercept_[0]
+    w = st.session_state["clf"].coef_[0]
+    b = st.session_state["clf"].intercept_[0]
     xs = np.array(xlim)
     ys = -(w[0] * xs + b) / w[1]
 

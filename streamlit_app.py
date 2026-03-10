@@ -94,6 +94,11 @@ def run_training(tokens, feature_set=None, sample_size=SAMPLE_SIZE):
             "pos": pos_vals,
         }
 
+    # drop columns with no features selected
+    feature_set = {col: feats for col, feats in feature_set.items() if feats}
+    if not feature_set:
+        raise ValueError("No features selected.")
+
     # --- training samples ---
     nr_mask = tokens["speaker"].isna()
     sp_mask = tokens["speaker"].notna() & tokens["speaker"].ne("Odysseus-Apologue")
@@ -317,9 +322,13 @@ with st.sidebar:
         )
 
 if "pca_model" not in st.session_state:
-    with st.spinner("Training model..."):
-        feature_set = st.session_state.get("selected_features")
-        run_training(tokens, feature_set=feature_set)
+    try:
+        with st.spinner("Training model..."):
+            feature_set = st.session_state.get("selected_features")
+            run_training(tokens, feature_set=feature_set)
+    except ValueError as e:
+        st.error(str(e))
+        st.stop()
 
 if "speech_score" not in st.session_state:
     with st.spinner("Computing speech scores..."):

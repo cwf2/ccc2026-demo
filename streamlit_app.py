@@ -268,15 +268,11 @@ with st.sidebar:
     lemma_tab, pos_tab = st.tabs(["Lemma", "POS"])
 
     with lemma_tab:
-        c1, c2 = st.columns(2)
-        if c1.button("Check all", key="lemma_check_all"):
-            st.session_state["lemma_all"] = True
+        def _on_lemma_toggle():
+            st.session_state["lemma_all"] = st.session_state["lemma_toggle"]
             st.session_state.pop("lemma_editor", None)
-            st.rerun()
-        if c2.button("Uncheck all", key="lemma_uncheck_all"):
-            st.session_state["lemma_all"] = False
-            st.session_state.pop("lemma_editor", None)
-            st.rerun()
+        st.toggle("Select all", value=st.session_state.get("lemma_all", True),
+                  key="lemma_toggle", on_change=_on_lemma_toggle)
         lemma_default = st.session_state.get("lemma_all", True)
         lemma_feat_df = pd.DataFrame({
             "lemma": lemma_feat_count.index,
@@ -296,15 +292,11 @@ with st.sidebar:
         )
 
     with pos_tab:
-        c1, c2 = st.columns(2)
-        if c1.button("Check all", key="pos_check_all"):
-            st.session_state["pos_all"] = True
+        def _on_pos_toggle():
+            st.session_state["pos_all"] = st.session_state["pos_toggle"]
             st.session_state.pop("pos_editor", None)
-            st.rerun()
-        if c2.button("Uncheck all", key="pos_uncheck_all"):
-            st.session_state["pos_all"] = False
-            st.session_state.pop("pos_editor", None)
-            st.rerun()
+        st.toggle("Select all", value=st.session_state.get("pos_all", True),
+                  key="pos_toggle", on_change=_on_pos_toggle)
         pos_all = st.session_state.get("pos_all", None)
         pos_df = pd.DataFrame({
             "pos": pos_tags,

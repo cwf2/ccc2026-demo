@@ -228,7 +228,7 @@ with st.sidebar:
         "Seed (-1 = random)",
         value=-1,
         min_value=-1,
-        max_value=2**128 - 1,
+        max_value=2**53 - 1,
         step=1,
     )
     st.caption(f"Current seed: {st.session_state['seed']}")

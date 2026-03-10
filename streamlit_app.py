@@ -234,20 +234,25 @@ with st.sidebar:
     st.caption(f"Current seed: {st.session_state['seed']}")
 
     if st.button("Recalculate"):
+        lemma_default = st.session_state.get("lemma_all", True)
         lemma_state = st.session_state.get("lemma_editor", {})
         lemma_edits = lemma_state.get("edited_rows", {})
         selected_lemmas = [
             lemma
             for i, lemma in enumerate(lemma_feat_count.index)
-            if lemma_edits.get(i, {}).get("include", True)
+            if lemma_edits.get(i, {}).get("include", lemma_default)
         ]
 
+        pos_all = st.session_state.get("pos_all", None)
         pos_state = st.session_state.get("pos_editor", {})
         pos_edits = pos_state.get("edited_rows", {})
         selected_pos = [
             pos
             for i, pos in enumerate(pos_tags)
-            if pos_edits.get(i, {}).get("include", pos != "PUNCT")
+            if pos_edits.get(i, {}).get(
+                "include",
+                pos_all if pos_all is not None else pos != "PUNCT",
+            )
         ]
 
         st.session_state["selected_features"] = {
@@ -263,10 +268,20 @@ with st.sidebar:
     lemma_tab, pos_tab = st.tabs(["Lemma", "POS"])
 
     with lemma_tab:
+        c1, c2 = st.columns(2)
+        if c1.button("Check all", key="lemma_check_all"):
+            st.session_state["lemma_all"] = True
+            st.session_state.pop("lemma_editor", None)
+            st.rerun()
+        if c2.button("Uncheck all", key="lemma_uncheck_all"):
+            st.session_state["lemma_all"] = False
+            st.session_state.pop("lemma_editor", None)
+            st.rerun()
+        lemma_default = st.session_state.get("lemma_all", True)
         lemma_feat_df = pd.DataFrame({
             "lemma": lemma_feat_count.index,
             "frequency": lemma_feat_count.values,
-            "include": True,
+            "include": lemma_default,
         })
         st.data_editor(
             lemma_feat_df,
@@ -281,9 +296,22 @@ with st.sidebar:
         )
 
     with pos_tab:
+        c1, c2 = st.columns(2)
+        if c1.button("Check all", key="pos_check_all"):
+            st.session_state["pos_all"] = True
+            st.session_state.pop("pos_editor", None)
+            st.rerun()
+        if c2.button("Uncheck all", key="pos_uncheck_all"):
+            st.session_state["pos_all"] = False
+            st.session_state.pop("pos_editor", None)
+            st.rerun()
+        pos_all = st.session_state.get("pos_all", None)
         pos_df = pd.DataFrame({
             "pos": pos_tags,
-            "include": [p != "PUNCT" for p in pos_tags],
+            "include": [
+                pos_all if pos_all is not None else p != "PUNCT"
+                for p in pos_tags
+            ],
         })
         st.data_editor(
             pos_df,

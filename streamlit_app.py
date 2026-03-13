@@ -2,6 +2,7 @@
 # import statements
 #
 
+import json
 import streamlit as st
 import os
 from osfclient import OSF
@@ -83,16 +84,16 @@ def _window_dummies(tokens, col, features, window_size, tokens_per_window):
     return roll_sum.div(tokens_per_window, axis=0) * 1000
 
 
-def run_training(tokens, feature_set=None, sample_size=SAMPLE_SIZE):
+@st.cache_resource
+def get_model_data(feature_set_json: str, seed: int, sample_size: int = SAMPLE_SIZE):
+    """Train model and compute speech scores, cached across all sessions.
 
-    # --- default feature set ---
-    if feature_set is None:
-        lemma_count = tokens.loc[~(tokens["pos"] == "PUNCT"), "lemma"].value_counts()
-        pos_vals = sorted(v for v in tokens["pos"].dropna().unique() if v != "PUNCT")
-        feature_set = {
-            "lemma": list(lemma_count.head(N_FEATURES).index),
-            "pos": pos_vals,
-        }
+    Using @st.cache_resource means this runs once per unique (feature_set,
+    seed) combination regardless of how many sessions are active — health
+    checks and new browser tabs never trigger a recompute.
+    """
+    feature_set = json.loads(feature_set_json)
+    tokens = load_tokens()
 
     # drop columns with no features selected
     feature_set = {col: feats for col, feats in feature_set.items() if feats}
@@ -110,7 +111,7 @@ def run_training(tokens, feature_set=None, sample_size=SAMPLE_SIZE):
     auth_group_ids = tokens["work"].str.slice(0, 4)
     group_ids = auth_group_ids + "-" + nara_group_ids
 
-    rng = np.random.default_rng(st.session_state["seed"])
+    rng = np.random.default_rng(seed)
 
     sample_ids = pd.Series(index=tokens.index, dtype=str)
     for group in group_ids.unique():
@@ -152,30 +153,11 @@ def run_training(tokens, feature_set=None, sample_size=SAMPLE_SIZE):
     clf = LogisticRegression()
     clf.fit(X, y)
 
-    st.session_state["feature_set"] = feature_set
-    st.session_state["scalers"] = scalers
-    st.session_state["auth_group_ids"] = auth_group_ids
-    st.session_state["nara_group_ids"] = nara_group_ids
-    st.session_state["train_sample_ids"] = sample_ids
-    st.session_state["train_samples"] = train_samples
-    st.session_state["pca_model"] = pca_model
-    st.session_state["train_pca"] = train_pca
-    st.session_state["clf"] = clf
-
-
-def compute_speech_score(tokens, window_size=WINDOW_SIZE):
-    """Compute rolling speech scores from token table."""
-
-    feature_set = st.session_state["feature_set"]
-    scalers = st.session_state["scalers"]
-    pca_model = st.session_state["pca_model"]
-    clf = st.session_state["clf"]
-
-    # tokens per window — use lemma as proxy for total non-null tokens
+    # --- rolling speech score ---
     tokens_per_window = (
         tokens["lemma"]
-        .rolling(window=window_size, center=True,
-                 min_periods=int(window_size * 0.7))
+        .rolling(window=WINDOW_SIZE, center=True,
+                 min_periods=int(WINDOW_SIZE * 0.7))
         .agg("count")
         .fillna(0)
         .astype(int)
@@ -183,7 +165,7 @@ def compute_speech_score(tokens, window_size=WINDOW_SIZE):
 
     parts = []
     for col, features in feature_set.items():
-        raw = _window_dummies(tokens, col, features, window_size, tokens_per_window)
+        raw = _window_dummies(tokens, col, features, WINDOW_SIZE, tokens_per_window)
         scaled = pd.DataFrame(
             scalers[col].transform(raw),
             columns=[f"{col}_{f}" for f in features],
@@ -211,7 +193,19 @@ def compute_speech_score(tokens, window_size=WINDOW_SIZE):
         ),
         index=test_pca.index,
     )
-    return speech_score
+
+    return {
+        "feature_set": feature_set,
+        "scalers": scalers,
+        "auth_group_ids": auth_group_ids,
+        "nara_group_ids": nara_group_ids,
+        "train_sample_ids": sample_ids,
+        "train_samples": train_samples,
+        "pca_model": pca_model,
+        "train_pca": train_pca,
+        "clf": clf,
+        "speech_score": speech_score,
+    }
 
 
 #
@@ -266,8 +260,6 @@ with st.sidebar:
         }
         actual_seed = int(np.random.randint(0, 2**31)) if seed_input == -1 else seed_input
         st.session_state["seed"] = actual_seed
-        for key in ["pca_model", "speech_score"]:
-            st.session_state.pop(key, None)
         st.rerun()
 
     lemma_tab, pos_tab = st.tabs(["Lemma", "POS"])
@@ -321,20 +313,27 @@ with st.sidebar:
             disabled=["pos"],
         )
 
-if "pca_model" not in st.session_state:
-    try:
-        with st.spinner("Training model..."):
-            feature_set = st.session_state.get("selected_features")
-            run_training(tokens, feature_set=feature_set)
-    except ValueError as e:
-        st.error(str(e))
-        st.stop()
+# Build the feature-set JSON used as the cache key.
+# sort_keys ensures the string is deterministic regardless of dict order.
+if "selected_features" in st.session_state:
+    feature_set_json = json.dumps(
+        st.session_state["selected_features"], ensure_ascii=False, sort_keys=True
+    )
+else:
+    default_fs = {
+        "lemma": list(lemma_feat_count.index),
+        "pos": [p for p in pos_tags if p != "PUNCT"],
+    }
+    feature_set_json = json.dumps(default_fs, ensure_ascii=False, sort_keys=True)
 
-if "speech_score" not in st.session_state:
-    with st.spinner("Computing speech scores..."):
-        st.session_state["speech_score"] = compute_speech_score(tokens)
+try:
+    with st.spinner("Training model..."):
+        md = get_model_data(feature_set_json, st.session_state["seed"])
+except ValueError as e:
+    st.error(str(e))
+    st.stop()
 
-speech_score = st.session_state["speech_score"]
+speech_score = md["speech_score"]
 
 #
 # plot
@@ -345,16 +344,16 @@ tab_model, tab_view = st.tabs(["Model", "View"])
 with tab_model:
 
     # plot
-    auth_labels = (st.session_state["auth_group_ids"]
-                    .groupby(st.session_state["train_sample_ids"])
+    auth_labels = (md["auth_group_ids"]
+                    .groupby(md["train_sample_ids"])
                     .agg("first")
                     .values)
-    nara_labels = (st.session_state["nara_group_ids"]
-                    .groupby(st.session_state["train_sample_ids"])
+    nara_labels = (md["nara_group_ids"]
+                    .groupby(md["train_sample_ids"])
                     .agg("first")
                     .values)
 
-    g = sns.relplot(data=st.session_state["train_pca"],
+    g = sns.relplot(data=md["train_pca"],
         x = "PC1",
         y = "PC2",
         hue = auth_labels,
@@ -368,8 +367,8 @@ with tab_model:
 
     # solve for y at each x endpoint: coef[0]*x + coef[1]*y + intercept = 0
     #   => y = -(coef[0]*x + intercept) / coef[1]
-    w = st.session_state["clf"].coef_[0]
-    b = st.session_state["clf"].intercept_[0]
+    w = md["clf"].coef_[0]
+    b = md["clf"].intercept_[0]
     xs = np.array(xlim)
     ys = -(w[0] * xs + b) / w[1]
 

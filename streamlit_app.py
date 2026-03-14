@@ -282,7 +282,7 @@ with st.sidebar:
             column_config={
                 "include": st.column_config.CheckboxColumn("Include"),
             },
-            use_container_width=True,
+            width='stretch',
             height=400,
             hide_index=True,
             disabled=["lemma", "frequency"],
@@ -308,7 +308,7 @@ with st.sidebar:
             column_config={
                 "include": st.column_config.CheckboxColumn("Include"),
             },
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             disabled=["pos"],
         )

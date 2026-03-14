@@ -84,7 +84,7 @@ def _window_dummies(tokens, col, features, window_size, tokens_per_window):
     return roll_sum.div(tokens_per_window, axis=0) * 1000
 
 
-@st.cache_resource
+@st.cache_resource(max_entries=1)
 def get_model_data(feature_set_json: str, seed: int, sample_size: int = SAMPLE_SIZE):
     """Train model and compute speech scores, cached across all sessions.
 
